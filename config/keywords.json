@@ -1,0 +1,23 @@
+{
+  "_note": "Case-insensitive substring match against post text. Operator-tunable. Edit and push; the agent reads this file every cycle.",
+  "patterns": [
+    "wts",
+    "wtb",
+    "wts:",
+    "wtb:",
+    "fs:",
+    "fs ",
+    "for sale",
+    "selling",
+    "looking for",
+    "in search of",
+    "iso",
+    "iso:",
+    "parts",
+    "needed",
+    "buying",
+    "trade",
+    "trading",
+    "swap"
+  ]
+}
