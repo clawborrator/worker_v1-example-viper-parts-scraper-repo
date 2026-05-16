@@ -98,15 +98,17 @@ If `{ok: false}` with `error: "not logged in"` or `error:
 ```bash
 cd /workspace/repo
 GROUPS=$(jq -c '.groups[] | select(.active != false)' config/groups.json)
-KEYWORDS=$(jq -r '.patterns[]' config/keywords.json)
 ```
 
 `config/groups.json` lists which groups to scrape. Each entry:
 `{name, url, active}`. The operator edits this file out of band
 to add/remove groups.
 
-`config/keywords.json` lists the patterns (case-insensitive
-substring match) that mark a post as a buy/sell candidate.
+`config/keywords.json` exists in the repo but is no longer used
+for filtering. The agent now classifies every post on its own
+merits (see step 5). The file is kept for documentation and may
+be reintroduced as a coarse pre-filter later if cost becomes a
+concern.
 
 ### Step 3. Build the seen-URL set (bash, your turn)
 
@@ -163,26 +165,37 @@ group visits):
 sleep $((30 + RANDOM % 30))
 ```
 
-### Step 5. Filter + classify + dedupe (your turn)
+### Step 5. Classify + dedupe (your turn)
 
 For each post across all groups:
 
-1. **Keyword filter.** Case-insensitive substring match against
-   `text`. Post must contain at least one keyword from
-   `config/keywords.json` (e.g. `wts`, `wtb`, `for sale`, `iso`,
-   `parts`, `looking for`). If no match, drop the post.
-2. **Classify.** Use your judgment on the text:
-   - `sell` if it looks like the author is offering something
-     (WTS, FS, selling, "asking $X", "for sale")
-   - `buy` if they're looking (WTB, ISO, "looking for", "anyone
-     have")
-   - `ambiguous` if you can't tell (general parts discussion,
-     unclear)
-3. **Dedup.** If `post_url` is in the seen set from step 3,
-   drop the post. We've already reported it.
-4. **Extract structured fields where you can.** From the text,
+1. **Dedup.** If `post_url` is in the seen set from step 3,
+   drop the post. We've already reported it. This runs FIRST so
+   you don't waste judgment on posts you'll throw away.
+2. **Classify.** Use your judgment on the post text + photos to
+   pick one of:
+   - `sell` — author is offering something. Signals: a price
+     (with or without `$`), photos of a part / car / accessory,
+     phrasing like "asking", "OBO", "shipped", "FS", "WTS",
+     "selling", "for sale", "letting go of", "moving / parting
+     out", or just a clear product title + dollar amount
+     (Facebook Marketplace listings often have no shorthand).
+   - `buy` — author is looking for something. Signals: "WTB",
+     "ISO", "looking for", "anyone have", "need", "wanted",
+     phrasing in question form about availability.
+   - `ambiguous` — clearly automotive-parts-related but you
+     can't tell if it's a buy or sell (e.g. someone asking
+     about compatibility for a part they MIGHT later buy or
+     sell). Keep these; the operator can decide.
+   - `general` — anything else. Photo of someone's car, event
+     announcements, polls, jokes, general discussion, mod
+     showcases without sale intent. **Drop these.**
+3. **Extract structured fields where you can.** From the text,
    pull what's obvious: item name, price, location. Don't
    hallucinate; leave fields null if not in the text.
+
+Keep posts classified as `sell`, `buy`, or `ambiguous`. Drop
+`general`.
 
 Produce a list of new-candidate records:
 
