@@ -1,0 +1,37 @@
+{
+  "ts": "2026-05-16T18:29:00Z",
+  "groups_scraped": [
+    {"url": "https://www.facebook.com/groups/4viperclub", "name": "4viperclub", "posts_extracted": 13, "candidates_kept": 1},
+    {"url": "https://www.facebook.com/groups/2574946562765549", "name": "Viper Group 2574946562765549", "posts_extracted": 13, "candidates_kept": 1},
+    {"url": "https://www.facebook.com/groups/646530975516107", "name": "Viper Group 646530975516107", "posts_extracted": 14, "candidates_kept": 0}
+  ],
+  "new_matches": [
+    {
+      "post_url": "https://www.facebook.com/groups/4viperclub/posts/10163433262977955/",
+      "post_id": "10163433262977955",
+      "group_url": "https://www.facebook.com/groups/4viperclub",
+      "author": "George Harley Roush",
+      "classification": "buy",
+      "text_summary": "User asking how much it costs to buy just the sticker",
+      "item": "Viper sticker/decal",
+      "price": null,
+      "location": null,
+      "photos": [],
+      "age_hours": null
+    },
+    {
+      "post_url": "https://www.facebook.com/groups/2574946562765549/posts/4198525047074351/",
+      "post_id": "4198525047074351",
+      "group_url": "https://www.facebook.com/groups/2574946562765549",
+      "author": "Doc Beckmann",
+      "classification": "ambiguous",
+      "text_summary": "User states headlights are only worth $500, in context suggesting a buy/sell thread",
+      "item": "headlights",
+      "price": "$500",
+      "location": null,
+      "photos": [],
+      "age_hours": null
+    }
+  ],
+  "skip_reason": null
+}
