@@ -36,17 +36,19 @@ const SELECTORS = {
   // button; pre-login the same area has "Sign Up" / "Log In".
   loggedInAccountButton: '[aria-label*="Your profile" i], [aria-label="Account"]',
 
-  // Post containers in a group feed. Comet UI wraps each post
-  // in a div with role="article". This is the most stable
-  // signal.
+  // Post containers in a group feed. Comet UI wraps both posts
+  // AND comments in role="article", so a bare role-article match
+  // picks up comments-as-posts. We grab all role-article elements
+  // first then JS-filter to TOP-LEVEL ones (no ancestor role-
+  // article) inside the extraction loop. aria-posinset would be
+  // a cleaner discriminator but Comet doesn't always emit it on
+  // group feeds.
   postArticle:           'div[role="article"]',
 
-  // Inside a post:
-  postAuthorLink:        'h3 a[role="link"], h2 a[role="link"]',
-  // Post body text is in nested spans without stable classes.
-  // The post text usually lives inside [data-ad-comet-preview]
-  // or the first long-text container.
-  postBodyContainer:     '[data-ad-comet-preview], [data-ad-preview]',
+  // Inside a post header. Author live links are anchors to
+  // /user/<id>/ within the group, or to /<vanity>/ at the root.
+  // Multiple fallbacks because Comet hashes class names.
+  postAuthorLink:        'a[role="link"][href*="/user/"], a[role="link"][href*="/profile.php"], a[role="link"][aria-label*="profile" i], h3 strong a, h2 strong a, h3 a[role="link"]',
   // Permalink is anchored to the post's timestamp.
   postTimestampLink:     'a[role="link"][href*="/posts/"], a[role="link"][href*="/permalink/"], a[href*="?multi_permalinks"]',
   // Photo thumbnails inside the post.
@@ -135,7 +137,11 @@ async function snapshotNav(page, contextTag, navLabel) {
   const absolutePath = `${SCREENSHOTS_DIR}/${filename}`;
   const repoRelativePath = `data/screenshots/${filename}`;
   try {
-    await page.screenshot({ path: absolutePath, fullPage: true });
+    // Viewport-only (not fullPage). Facebook's Comet UI pads pages
+    // with massive empty regions when rendered headed, so fullPage
+    // PNGs are mostly whitespace and run 2-10MB. Viewport-only is
+    // ~200-500KB and shows what the user would actually see.
+    await page.screenshot({ path: absolutePath, fullPage: false });
     return repoRelativePath;
   } catch {
     return null;
@@ -188,6 +194,45 @@ function extractPostId(url) {
   if (!url) return null;
   const m = url.match(/\/posts\/(\d+)|\/permalink\/(\d+)|multi_permalinks=(\d+)/);
   return (m && (m[1] || m[2] || m[3])) || null;
+}
+
+// Comet renders a post as concatenated text with no clean
+// semantic separator: AuthorName, optional ContributorBadge,
+// optional "· Follow", BodyText, AgeText, "LikeReplyShare",
+// optional ReactionCount. innerText preserves block boundaries
+// as newlines, which lets us split + filter UI noise to isolate
+// the actual author + body.
+function cleanFacebookPostText(raw) {
+  if (!raw) return { author: null, body: '' };
+  const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+
+  const isNoise = (line) =>
+    /^(Like|Reply|Share|Follow|Comment|See more|See translation|Sponsored|Edited)$/i.test(line) ||
+    /^· Follow$/i.test(line) ||
+    /^All-star contributor$/i.test(line) ||
+    /^Rising contributor$/i.test(line) ||
+    /^Top contributor$/i.test(line) ||
+    /^Group expert$/i.test(line) ||
+    /^Author$/i.test(line) ||
+    /^Anonymous member$/i.test(line) ||
+    /^Admin$/i.test(line) ||
+    /^Moderator$/i.test(line) ||
+    /^\d+\s*(s|m|h|d|w|y|mo)$/i.test(line) ||      // age "43w", "23h", "5m"
+    /^(Yesterday|Today)\s+at\s+/i.test(line) ||
+    /^\d+(\.\d+)?[KMB]?$/i.test(line) ||           // reaction counts "131", "1.2K"
+    /^All comments$/i.test(line) ||
+    /^Most relevant$/i.test(line) ||
+    /^View\s+\d+/i.test(line) ||
+    /^Hide\s+\d+/i.test(line);
+
+  const meaningful = lines.filter((l) => !isNoise(l));
+  const author = meaningful[0] || null;
+  // Strip leading author from body lines just in case it bled
+  // into the next line, then join.
+  const bodyLines = meaningful.slice(1);
+  const body = bodyLines.join(' ').replace(/\s+/g, ' ').trim();
+
+  return { author, body };
 }
 
 // ─── Subcommand: auth-check ───────────────────────────────────
@@ -298,20 +343,29 @@ async function cmdReadGroup(args) {
       screenshots.push(await snapshotNav(page, 'read-group', `after-scroll-${pass + 1}`));
     }
 
-    const posts = [];
-    for (const article of articles.slice(0, count)) {
-      try {
-        const author = (await article.locator(SELECTORS.postAuthorLink).first().textContent().catch(() => null))?.trim()?.replace(/\s+/g, ' ');
-        // Post text. Multiple candidate containers; try in order.
-        let text = (await article.locator(SELECTORS.postBodyContainer).first().textContent().catch(() => ''))?.trim();
-        if (!text) {
-          // Fallback: grab the whole article text and trim the author header.
-          text = (await article.textContent().catch(() => ''))?.trim();
-          if (author && text) text = text.replace(author, '').trim();
+    // Filter to TOP-LEVEL articles only. Comet renders comments
+    // and replies as nested role-article elements; without this
+    // filter the same post appears multiple times (once for the
+    // post, once per visible comment).
+    const topLevelArticles = [];
+    for (const article of articles) {
+      const isNested = await article.evaluate((el) => {
+        let p = el.parentElement;
+        while (p) {
+          if (p.matches && p.matches('div[role="article"]')) return true;
+          p = p.parentElement;
         }
-        text = (text || '').replace(/\s+/g, ' ').slice(0, 2000);
+        return false;
+      }).catch(() => false);
+      if (!isNested) topLevelArticles.push(article);
+    }
 
-        // Permalink + timestamp. Look for href patterns inside the article.
+    const posts = [];
+    const seenPostIds = new Set();
+    for (const article of topLevelArticles.slice(0, count)) {
+      try {
+        // Permalink + timestamp first; the post_id from the URL
+        // is the dedup key inside this cycle.
         const timestampLinks = await article.locator(SELECTORS.postTimestampLink).all();
         let permalinkHref = null;
         for (const tl of timestampLinks.slice(0, 5)) {
@@ -323,6 +377,30 @@ async function cmdReadGroup(args) {
         }
         const postUrl = normalizePostUrl(permalinkHref);
         const postId = extractPostId(postUrl);
+
+        // In-cycle dedup: skip if we've already seen this post-id
+        // in this same scrape. (Cross-cycle dedup is the agent's
+        // job; this one catches the case where the same post
+        // renders twice in the same feed pass.)
+        if (postId && seenPostIds.has(postId)) continue;
+        if (postId) seenPostIds.add(postId);
+
+        // Author: try the link-based selector first, fall back
+        // to the cleaned-text first-line later.
+        const linkAuthor = (await article.locator(SELECTORS.postAuthorLink).first().textContent({ timeout: 1_500 }).catch(() => null))?.trim()?.replace(/\s+/g, ' ');
+
+        // Body text: use innerText (preserves block boundaries
+        // as newlines) instead of textContent (everything mashed).
+        // Then run the UI-noise stripper.
+        const rawInnerText = (await article.innerText().catch(() => ''));
+        const { author: cleanedAuthor, body: cleanedBody } = cleanFacebookPostText(rawInnerText);
+
+        const author = linkAuthor || cleanedAuthor || null;
+        // If link-based author matched, strip it from the body
+        // in case it bled in.
+        let text = cleanedBody;
+        if (author && text.startsWith(author)) text = text.slice(author.length).trim();
+        text = text.slice(0, 2000);
 
         // Photos: collect scontent image URLs.
         const photoLocators = await article.locator(SELECTORS.postPhoto).all();
