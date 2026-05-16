@@ -332,108 +332,109 @@ async function cmdReadGroup(args) {
     }
     await assertNotChallenged(page);
 
-    // Scroll to load posts. Facebook lazy-renders; need multiple
-    // passes with hydration time between each.
-    let articles = [];
-    for (let pass = 0; pass < 8; pass++) {
-      articles = await page.locator(SELECTORS.postArticle).all();
-      if (articles.length >= count) break;
+    // Scroll + accumulate. Facebook uses virtual scrolling: it
+    // unmounts posts that have scrolled out of view to save
+    // memory. A final-state-only extraction sees only the
+    // currently-visible 2-4 posts after extensive scrolling,
+    // even though we passed THROUGH 20+ posts on the way down.
+    // Fix: extract from whatever is currently rendered after
+    // EACH scroll pass, accumulate into a Map keyed by post_id,
+    // dedup as we go. Break when we have `count` distinct posts
+    // OR we run out of scroll passes.
+    const accumulator = new Map();   // post_id -> post-record
+    const unknownIdAccumulator = [];  // posts with no extractable post_id (rare, fallback)
+
+    for (let pass = 0; pass <= 8; pass++) {
+      const articles = await page.locator(SELECTORS.postArticle).all();
+      for (const article of articles) {
+        try {
+          // Skip nested articles (comments).
+          const isNested = await article.evaluate((el) => {
+            let p = el.parentElement;
+            while (p) {
+              if (p.matches && p.matches('div[role="article"]')) return true;
+              p = p.parentElement;
+            }
+            return false;
+          }).catch(() => false);
+          if (isNested) continue;
+
+          // Permalink + post_id are the dedup key.
+          const timestampLinks = await article.locator(SELECTORS.postTimestampLink).all();
+          let permalinkHref = null;
+          for (const tl of timestampLinks.slice(0, 5)) {
+            const href = await tl.getAttribute('href').catch(() => null);
+            if (href && (/\/posts\//.test(href) || /\/permalink\//.test(href) || /multi_permalinks=/.test(href))) {
+              permalinkHref = href;
+              break;
+            }
+          }
+          const postUrl = normalizePostUrl(permalinkHref);
+          const postId = extractPostId(postUrl);
+
+          if (postId && accumulator.has(postId)) continue;
+
+          // Extract the rest.
+          const linkAuthor = (await article.locator(SELECTORS.postAuthorLink).first().textContent({ timeout: 1_500 }).catch(() => null))?.trim()?.replace(/\s+/g, ' ');
+          const rawInnerText = (await article.innerText().catch(() => ''));
+          const { author: cleanedAuthor, body: cleanedBody } = cleanFacebookPostText(rawInnerText);
+
+          const author = linkAuthor || cleanedAuthor || null;
+          let text = cleanedBody;
+          if (author && text.startsWith(author)) text = text.slice(author.length).trim();
+          text = text.slice(0, 2000);
+
+          const photoLocators = await article.locator(SELECTORS.postPhoto).all();
+          const photos = [];
+          for (const p of photoLocators.slice(0, 6)) {
+            const src = await p.getAttribute('src').catch(() => null);
+            if (src) photos.push(src);
+          }
+
+          const ageText = (await article.locator('a[role="link"][aria-label*="hour" i], a[role="link"][aria-label*="day" i], a[role="link"][aria-label*="minute" i]').first().textContent().catch(() => null))?.trim();
+
+          if (!postUrl && !text) continue;
+
+          const record = {
+            post_id: postId,
+            post_url: postUrl,
+            author: author || null,
+            text,
+            age_text: ageText || null,
+            age_hours: null,
+            photos,
+          };
+
+          if (postId) {
+            accumulator.set(postId, record);
+          } else {
+            // Fallback: stash by text-prefix to dedup the
+            // not-uncommon case where a post has no extractable
+            // post_id (e.g. timestamp link not yet rendered).
+            const key = (text || '').slice(0, 120);
+            if (key && !unknownIdAccumulator.some((r) => (r.text || '').slice(0, 120) === key)) {
+              unknownIdAccumulator.push(record);
+            }
+          }
+        } catch (e) {
+          continue;
+        }
+      }
+
+      if (accumulator.size + unknownIdAccumulator.length >= count) break;
+      if (pass === 8) break;
       await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
       await page.waitForTimeout(1_500);
       screenshots.push(await snapshotNav(page, 'read-group', `after-scroll-${pass + 1}`));
     }
 
-    // Filter to TOP-LEVEL articles only. Comet renders comments
-    // and replies as nested role-article elements; without this
-    // filter the same post appears multiple times (once for the
-    // post, once per visible comment).
-    const topLevelArticles = [];
-    for (const article of articles) {
-      const isNested = await article.evaluate((el) => {
-        let p = el.parentElement;
-        while (p) {
-          if (p.matches && p.matches('div[role="article"]')) return true;
-          p = p.parentElement;
-        }
-        return false;
-      }).catch(() => false);
-      if (!isNested) topLevelArticles.push(article);
-    }
-
-    const posts = [];
-    const seenPostIds = new Set();
-    for (const article of topLevelArticles.slice(0, count)) {
-      try {
-        // Permalink + timestamp first; the post_id from the URL
-        // is the dedup key inside this cycle.
-        const timestampLinks = await article.locator(SELECTORS.postTimestampLink).all();
-        let permalinkHref = null;
-        for (const tl of timestampLinks.slice(0, 5)) {
-          const href = await tl.getAttribute('href').catch(() => null);
-          if (href && (/\/posts\//.test(href) || /\/permalink\//.test(href) || /multi_permalinks=/.test(href))) {
-            permalinkHref = href;
-            break;
-          }
-        }
-        const postUrl = normalizePostUrl(permalinkHref);
-        const postId = extractPostId(postUrl);
-
-        // In-cycle dedup: skip if we've already seen this post-id
-        // in this same scrape. (Cross-cycle dedup is the agent's
-        // job; this one catches the case where the same post
-        // renders twice in the same feed pass.)
-        if (postId && seenPostIds.has(postId)) continue;
-        if (postId) seenPostIds.add(postId);
-
-        // Author: try the link-based selector first, fall back
-        // to the cleaned-text first-line later.
-        const linkAuthor = (await article.locator(SELECTORS.postAuthorLink).first().textContent({ timeout: 1_500 }).catch(() => null))?.trim()?.replace(/\s+/g, ' ');
-
-        // Body text: use innerText (preserves block boundaries
-        // as newlines) instead of textContent (everything mashed).
-        // Then run the UI-noise stripper.
-        const rawInnerText = (await article.innerText().catch(() => ''));
-        const { author: cleanedAuthor, body: cleanedBody } = cleanFacebookPostText(rawInnerText);
-
-        const author = linkAuthor || cleanedAuthor || null;
-        // If link-based author matched, strip it from the body
-        // in case it bled in.
-        let text = cleanedBody;
-        if (author && text.startsWith(author)) text = text.slice(author.length).trim();
-        text = text.slice(0, 2000);
-
-        // Photos: collect scontent image URLs.
-        const photoLocators = await article.locator(SELECTORS.postPhoto).all();
-        const photos = [];
-        for (const p of photoLocators.slice(0, 6)) {
-          const src = await p.getAttribute('src').catch(() => null);
-          if (src) photos.push(src);
-        }
-
-        // Age. FB shows "3h", "2d", "Yesterday at 3:14 PM", etc.
-        // We pull whatever text the timestamp link shows; the
-        // agent's judgment side parses it.
-        const ageText = (await article.locator('a[role="link"][aria-label*="hour" i], a[role="link"][aria-label*="day" i], a[role="link"][aria-label*="minute" i]').first().textContent().catch(() => null))?.trim();
-
-        if (!postUrl && !text) continue;
-        posts.push({
-          post_id: postId,
-          post_url: postUrl,
-          author: author || null,
-          text,
-          age_text: ageText || null,
-          age_hours: null,
-          photos,
-        });
-      } catch (e) {
-        continue;
-      }
-    }
+    const posts = [...accumulator.values(), ...unknownIdAccumulator].slice(0, count);
 
     emit({
       ok: true,
       group_url: groupUrl,
       posts,
+      posts_count: posts.length,
       screenshots: screenshots.filter(Boolean),
     });
   } catch (e) {
