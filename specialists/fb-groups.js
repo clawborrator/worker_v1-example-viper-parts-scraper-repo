@@ -334,90 +334,147 @@ async function cmdReadGroup(args) {
 
     // Scroll + accumulate. Facebook uses virtual scrolling: it
     // unmounts posts that have scrolled out of view to save
-    // memory. A final-state-only extraction sees only the
-    // currently-visible 2-4 posts after extensive scrolling,
-    // even though we passed THROUGH 20+ posts on the way down.
-    // Fix: extract from whatever is currently rendered after
-    // EACH scroll pass, accumulate into a Map keyed by post_id,
-    // dedup as we go. Break when we have `count` distinct posts
-    // OR we run out of scroll passes.
+    // memory. Final-state-only extraction sees only the 2-4
+    // currently-visible posts even after extensive scrolling.
+    //
+    // Performance lesson from the previous version: per-article
+    // Playwright API calls (15+ round-trips per post × 20
+    // posts × 8 passes = ~2400 wire trips) make each pass take
+    // ~2 minutes. Total cycle: ~50 min. Unacceptable.
+    //
+    // Fix: do ALL extraction inside a single page.evaluate()
+    // per pass, returning plain JSON. One wire trip per pass
+    // instead of thousands. Per-pass time drops from ~2 min
+    // to <2s. Total cycle ~5 min for 3 groups.
     const accumulator = new Map();   // post_id -> post-record
-    const unknownIdAccumulator = [];  // posts with no extractable post_id (rare, fallback)
+    const unknownIdAccumulator = [];
 
     for (let pass = 0; pass <= 8; pass++) {
-      const articles = await page.locator(SELECTORS.postArticle).all();
-      for (const article of articles) {
-        try {
-          // Skip nested articles (comments).
-          const isNested = await article.evaluate((el) => {
-            let p = el.parentElement;
+      // Run extraction in the browser context. This is the hot
+      // path: one round-trip carries N article records back.
+      const passResults = await page.evaluate(() => {
+        function cleanFacebookPostText(raw) {
+          if (!raw) return { author: null, body: '' };
+          const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+          const isNoise = (line) =>
+            /^(Like|Reply|Share|Follow|Comment|See more|See translation|Sponsored|Edited)$/i.test(line) ||
+            /^· Follow$/i.test(line) ||
+            /^All-star contributor$/i.test(line) ||
+            /^Rising contributor$/i.test(line) ||
+            /^Top contributor$/i.test(line) ||
+            /^Group expert$/i.test(line) ||
+            /^Author$/i.test(line) ||
+            /^Anonymous member$/i.test(line) ||
+            /^Admin$/i.test(line) ||
+            /^Moderator$/i.test(line) ||
+            /^\d+\s*(s|m|h|d|w|y|mo)$/i.test(line) ||
+            /^(Yesterday|Today)\s+at\s+/i.test(line) ||
+            /^\d+(\.\d+)?[KMB]?$/i.test(line) ||
+            /^All comments$/i.test(line) ||
+            /^Most relevant$/i.test(line) ||
+            /^View\s+\d+/i.test(line) ||
+            /^Hide\s+\d+/i.test(line);
+          const meaningful = lines.filter((l) => !isNoise(l));
+          const author = meaningful[0] || null;
+          const body = meaningful.slice(1).join(' ').replace(/\s+/g, ' ').trim();
+          return { author, body };
+        }
+        function extractPostId(url) {
+          if (!url) return null;
+          const m = url.match(/\/posts\/(\d+)|\/permalink\/(\d+)|multi_permalinks=(\d+)/);
+          return (m && (m[1] || m[2] || m[3])) || null;
+        }
+        function normalizePostUrl(href) {
+          if (!href) return null;
+          const stripped = href.split('?')[0].split('#')[0];
+          if (stripped.startsWith('http')) return stripped;
+          return 'https://www.facebook.com' + stripped;
+        }
+        const articles = Array.from(document.querySelectorAll('div[role="article"]'));
+        const out = [];
+        for (const article of articles) {
+          try {
+            // Skip nested (comments).
+            let p = article.parentElement;
+            let isNested = false;
             while (p) {
-              if (p.matches && p.matches('div[role="article"]')) return true;
+              if (p.matches && p.matches('div[role="article"]')) { isNested = true; break; }
               p = p.parentElement;
             }
-            return false;
-          }).catch(() => false);
-          if (isNested) continue;
+            if (isNested) continue;
 
-          // Permalink + post_id are the dedup key.
-          const timestampLinks = await article.locator(SELECTORS.postTimestampLink).all();
-          let permalinkHref = null;
-          for (const tl of timestampLinks.slice(0, 5)) {
-            const href = await tl.getAttribute('href').catch(() => null);
-            if (href && (/\/posts\//.test(href) || /\/permalink\//.test(href) || /multi_permalinks=/.test(href))) {
-              permalinkHref = href;
-              break;
+            // Permalink lookup.
+            const tlinks = Array.from(article.querySelectorAll('a[role="link"][href*="/posts/"], a[role="link"][href*="/permalink/"], a[href*="?multi_permalinks"]'));
+            let permalinkHref = null;
+            for (const tl of tlinks.slice(0, 5)) {
+              const href = tl.getAttribute('href');
+              if (href && (/\/posts\//.test(href) || /\/permalink\//.test(href) || /multi_permalinks=/.test(href))) {
+                permalinkHref = href;
+                break;
+              }
             }
-          }
-          const postUrl = normalizePostUrl(permalinkHref);
-          const postId = extractPostId(postUrl);
+            const postUrl = normalizePostUrl(permalinkHref);
+            const postId = extractPostId(postUrl);
 
-          if (postId && accumulator.has(postId)) continue;
-
-          // Extract the rest.
-          const linkAuthor = (await article.locator(SELECTORS.postAuthorLink).first().textContent({ timeout: 1_500 }).catch(() => null))?.trim()?.replace(/\s+/g, ' ');
-          const rawInnerText = (await article.innerText().catch(() => ''));
-          const { author: cleanedAuthor, body: cleanedBody } = cleanFacebookPostText(rawInnerText);
-
-          const author = linkAuthor || cleanedAuthor || null;
-          let text = cleanedBody;
-          if (author && text.startsWith(author)) text = text.slice(author.length).trim();
-          text = text.slice(0, 2000);
-
-          const photoLocators = await article.locator(SELECTORS.postPhoto).all();
-          const photos = [];
-          for (const p of photoLocators.slice(0, 6)) {
-            const src = await p.getAttribute('src').catch(() => null);
-            if (src) photos.push(src);
-          }
-
-          const ageText = (await article.locator('a[role="link"][aria-label*="hour" i], a[role="link"][aria-label*="day" i], a[role="link"][aria-label*="minute" i]').first().textContent().catch(() => null))?.trim();
-
-          if (!postUrl && !text) continue;
-
-          const record = {
-            post_id: postId,
-            post_url: postUrl,
-            author: author || null,
-            text,
-            age_text: ageText || null,
-            age_hours: null,
-            photos,
-          };
-
-          if (postId) {
-            accumulator.set(postId, record);
-          } else {
-            // Fallback: stash by text-prefix to dedup the
-            // not-uncommon case where a post has no extractable
-            // post_id (e.g. timestamp link not yet rendered).
-            const key = (text || '').slice(0, 120);
-            if (key && !unknownIdAccumulator.some((r) => (r.text || '').slice(0, 120) === key)) {
-              unknownIdAccumulator.push(record);
+            // Author via link selectors.
+            const authorSelectors = [
+              'a[role="link"][href*="/user/"]',
+              'a[role="link"][href*="/profile.php"]',
+              'a[role="link"][aria-label*="profile" i]',
+              'h3 strong a', 'h2 strong a',
+              'h3 a[role="link"]',
+            ];
+            let linkAuthor = null;
+            for (const sel of authorSelectors) {
+              const el = article.querySelector(sel);
+              if (el) {
+                const t = (el.textContent || '').trim().replace(/\s+/g, ' ');
+                if (t) { linkAuthor = t; break; }
+              }
             }
+
+            const rawInnerText = article.innerText || '';
+            const { author: cleanedAuthor, body: cleanedBody } = cleanFacebookPostText(rawInnerText);
+            const author = linkAuthor || cleanedAuthor || null;
+            let text = cleanedBody;
+            if (author && text.startsWith(author)) text = text.slice(author.length).trim();
+            text = text.slice(0, 2000);
+
+            const photos = Array.from(article.querySelectorAll('img[src*="scontent"]'))
+              .slice(0, 6)
+              .map((img) => img.getAttribute('src'))
+              .filter(Boolean);
+
+            const ageEl = article.querySelector('a[role="link"][aria-label*="hour" i], a[role="link"][aria-label*="day" i], a[role="link"][aria-label*="minute" i]');
+            const ageText = ageEl ? (ageEl.textContent || '').trim() : null;
+
+            if (!postUrl && !text) continue;
+
+            out.push({
+              post_id: postId,
+              post_url: postUrl,
+              author: author || null,
+              text,
+              age_text: ageText || null,
+              age_hours: null,
+              photos,
+            });
+          } catch (e) {
+            continue;
           }
-        } catch (e) {
-          continue;
+        }
+        return out;
+      });
+
+      // Accumulate on the Node side.
+      for (const record of passResults) {
+        if (record.post_id) {
+          if (!accumulator.has(record.post_id)) accumulator.set(record.post_id, record);
+        } else {
+          const key = (record.text || '').slice(0, 120);
+          if (key && !unknownIdAccumulator.some((r) => (r.text || '').slice(0, 120) === key)) {
+            unknownIdAccumulator.push(record);
+          }
         }
       }
 
